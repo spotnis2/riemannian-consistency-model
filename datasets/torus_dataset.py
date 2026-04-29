@@ -4,6 +4,9 @@ import pandas
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+import torch.nn as nn
+import os
+from tqdm import tqdm
 
 import biotite.structure as struc
 import biotite.structure.io.pdb as pdb
@@ -101,16 +104,17 @@ class RNAAngles(Dataset):
     @property
     def dimension(self):
         return self.data.shape[-1]
-
+    
 class SideChainAngleDataset(Dataset):
     def __init__(self, **kwargs):
         backbone_angles, side_chain_angles, sequences = self.read_pdbs()
         self.backbone_angles = backbone_angles
         self.side_chain_angles = side_chain_angles
         self.sequences = sequences
+        self.pad_data_for_conditioning()
     
     def read_pdbs(self):
-        file_name = "./pdb_s40_ids.txt"
+        files = ["./pdb_s40_ids.txt", "./bc40_ids.txt"]
 
         AA_MAP = {
             'ALA': 0, 'ARG': 1, 'ASN': 2, 'ASP': 3, 'CYS': 4,
@@ -121,79 +125,153 @@ class SideChainAngleDataset(Dataset):
         backbone_arrays = []
         side_chain_arrays = []
         sequence_arrays = []
-        with open(file_name) as f:
-            for line in f.readlines():
-                #download from pdb database
-                file_path = rcsb.fetch(line[:4], format="pdb", target_path="./data")
-                if line[5].isalpha():
-                    file = pdb.PDBFile.read(file_path)
-                    structure = file.get_structure(model=1)
-                    chain = structure[structure.chain_id == line[5]]
+        structs_downloaded = 0
+        for filename in tqdm(files, desc="Total Files", unit="file"):
+            # if structs_downloaded >= 1000:
+            #     break
+            with open(filename) as f:
+                for line in tqdm(f, total=sum(1 for _ in open(filename))):
+                    #download from pdb database
+                    # if structs_downloaded >= 1000:
+                    #     break
+                    if line[5].isalpha():
+                        try:
+                            file_path = rcsb.fetch(line[:4], format="pdb", target_path="./data")
+                            file = pdb.PDBFile.read(file_path)
+                            structure = file.get_structure(model=1)
+                            
+                            chain = structure[(structure.chain_id == line[5])]
+                            
+                            protein_mask = struc.filter_amino_acids(chain)
+                            clean_chain = chain[protein_mask]
+                            backbone = clean_chain[(np.isin(clean_chain.atom_name, ['N', 'C', 'CA', 'O']))].coord
+                            
+
+                        
+                            _, x_sequence = struc.get_residues(clean_chain)
+
+                            if len(backbone) != len(np.unique(clean_chain.res_id)) * 4:
+                                # Log a warning or implement a filler/interpolation strategy
+                                print(f"Warning: Missing backbone atoms")
+                                continue
+                            backbone_arrays.append(backbone)
+
+                            sequence_arrays.append(x_sequence)
+
+                        
+                            chi = struc.dihedral_side_chain(chain) #get chi angles
+                            
+                            x_sidechain = np.nan_to_num(chi)
+
+                            side_chain_arrays.append(x_sidechain)
+
+                            os.remove(file_path)
+                            structs_downloaded += 1
+                        except Exception as e:
+                            print(file_path)
+                            print(f"Error encountered: {e}")
+
+                    else:
+                        try:
+                            file_path = rcsb.fetch(line[:4], format="cif", target_path="./data")
+                            cif_file = pdbx.CIFFile.read(file_path)
+                        
+
+                            atoms = pdbx.get_structure(cif_file, model=1)
+                            
+                            boolean_index = (atoms.chain_id == line[5])
+                            # boolean_index = boolean_index[np.newaxis, ...]
+                            chain = atoms[(boolean_index)]
+                           
+                            protein_mask = struc.filter_amino_acids(chain)
+                            clean_chain = chain[protein_mask]
+                            backbone = clean_chain[(np.isin(clean_chain.atom_name, ['N', 'C', 'CA', 'O']))].coord
+                            if len(backbone) > 512:
+                                backbone = backbone[:512]
+                            
+                            _, x_sequence = struc.get_residues(clean_chain)
+                            if len(x_sequence) > 512:
+                                x_sequence = x_sequence[:512]
+
+                            if len(backbone) != len(np.unique(clean_chain.res_id)) * 4:
+                                # Log a warning or implement a filler/interpolation strategy
+                                print(f"Warning: Missing backbone atoms")
+                                continue
+                            backbone_arrays.append(backbone)
+
+                            sequence_arrays.append(x_sequence)
+
+                        
+                            chi = struc.dihedral_side_chain(chain) #get chi angles
+                            
+                            x_sidechain = np.nan_to_num(chi)
+
+                            if len(x_sidechain) > 512:
+                                x_sidechain = x_sidechain[:512]
+
+                            side_chain_arrays.append(x_sidechain)
+                            os.remove(file_path) #space conservation
+                            structs_downloaded += 1
+                        except Exception as e:
+                            print(file_path)
+                            print(f"Error encountered: {e}")
                     
-      
-                    phi, psi, omega = struc.dihedral_backbone(chain) #get backbone dihedral angles
-
-                    valid_mask = ~np.isnan(phi) & ~np.isnan(psi)
-
-                    x_backbone = np.stack([phi[valid_mask], psi[valid_mask]], axis=-1)
-
-                    backbone_arrays.append(x_backbone)
-
-
-                    chi = struc.dihedral_side_chain(chain) #get chi angles
-                    x_sidechain = np.nan_to_num(chi[valid_mask])
-
-                    side_chain_arrays.append(x_sidechain)
-
-                    ids, names = struc.get_residues(chain)
-
-                    
-                    x_sequence = names[valid_mask]
-
-                    #one hot encode the amino acids
-
-                    x_indices = np.array([AA_MAP.get(res_name, 20) for res_name in x_sequence])
-
-
-                    x_seq_one_hot = F.one_hot(x_indices, num_classes=21).float()
-
-                    sequence_arrays.append(x_seq_one_hot)
-                    
-                    
-
-                else:
-                    cif_file = pdbx.CIFFile.read(file_path)
-
-                    # 2. Convert to AtomArray
-                    atoms = pdbx.get_structure(cif_file, model=1)
-
-                    # 3. Filter by Entity ID (Note: these are strings '1', '2', etc.)
-                    entity_1 = atoms[atoms.entity_id == "1"]
-
-                    phi, psi, omega = struc.dihedral_backbone(entity_1) #get backbone dihedral angles
-
-                    valid_mask = ~np.isnan(phi) & ~np.isnan(psi)
-
-                    x_backbone = np.stack([phi[valid_mask], psi[valid_mask]], axis=-1)
-                    backbone_arrays.append(x_backbone)
-
-                    chi = struc.dihedral_side_chain(entity_1) #get chi angles
-                    x_sidechain = np.nan_to_num(chi[valid_mask])
-                    side_chain_arrays.append(x_sidechain)
-
-                    ids, names = struc.get_residues(entity_1)
-
-                    
-                    x_sequence = names[valid_mask]
-                    sequence_arrays.append(x_sequence)
-                    #one hot encode the amino acids
-
-                    x_indices = np.array([AA_MAP.get(res_name, 20) for res_name in x_sequence])
-
-        
-                    x_seq_one_hot = F.one_hot(x_indices, num_classes=21).float()
         return backbone_arrays, side_chain_arrays, sequence_arrays
                 
+    def pad_data_for_conditioning(self):
+        # have to combine backbone arrays and sequence arrays to make conditioning vectors
+        # will be using ProteinMPNN encoder
+        # why? intuitively understands the 3D space of backbones, and using it to encode means we'll avoid steric clashes.
+        max_len = max(len(arr) for arr in self.backbone_angles)
+        batch_size = len(self.backbone_angles)
+
+        batched_angles = np.zeros((batch_size, max_len, 3), dtype=np.float32)
+
+        padding_mask = np.zeros((batch_size, max_len), dtype=np.float32)
+
+        for i, arr in enumerate(self.backbone_angles):
+            L = len(arr)
+
+            batched_angles[i, :L, :] = arr
+
+            padding_mask[i, :L] = 1.0
+
+        tensor_angles = torch.tensor(batched_angles)
+        tensor_mask = torch.tensor(padding_mask)
+
+        #pad sequences
+        max_len_sequences = max(len(arr) for arr in self.sequences)
+        batch_size = len(self.sequences)
+
+        batched_sequences = np.empty((batch_size, max_len_sequences), dtype=object)
+
+        padding_mask_sequences = np.zeros((batch_size, max_len_sequences), dtype=np.float32)
+
+        for i, arr in enumerate(self.sequences):
+            L = len(arr)
+
+            batched_sequences[i, :L] = arr
+
+            padding_mask_sequences[i, :L] = 1.0       
+
+       #pad sidechain 
+        max_len_sc = max(len(arr) for arr in self.side_chain_angles)
+        batch_size = len(self.side_chain_angles)
+
+        batched_sc = np.empty((batch_size, max_len_sc, 4), dtype=np.float32)
+
+        padding_mask_sc = np.zeros((batch_size, max_len_sc), dtype=np.float32)
+
+        for i, arr in enumerate(self.side_chain_angles):
+            L = len(arr)
+
+            batched_sc[i, :L, :] = arr
+
+            padding_mask_sc[i, :L] = 1.0  
+        torch.save({'t1': tensor_angles, 't2': tensor_mask}, 'backbone_tensors.pt')
+        np.savez('sequence_data.npz', names=batched_sequences, mask=padding_mask_sequences)
+        np.savez('side_chain_data.npz', side_chains=batched_sc, mask=padding_mask_sc)
+
 
     def __len__(self):
         return len(self.data)
