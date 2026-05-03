@@ -24,7 +24,6 @@ class Block(torch.nn.Module):
         self.x_linear_2 = MPConv(out_channels, out_channels, kernel=[])
     
     def forward(self, x, emb):
-
         # x: [BS, 1, in_channels], emb: [BS, emb_channels]
         if self.x_linear_skip is not None:
             x = self.x_linear_skip(x)
@@ -53,15 +52,21 @@ class MPModel(torch.nn.Module):
         x_channel_mult=[2, 4, 4, 2],
         emb_channel_mult=2,
         dropout=0.0,
+        label_dim=0, # 0 = unconditional; 128 for ProteinMPNN conditioning
     ):
         super().__init__()
-        self.x_channel = [x * base_channels for x in x_channel_mult]
+        self.x_channel   = [x * base_channels for x in x_channel_mult]
         self.emb_channel = emb_channel_mult * base_channels
-        self.dropout = dropout
+        self.dropout     = dropout
 
+        # Time embedding
         self.emb_fourier = MPFourier(base_channels)
-        self.emb_noise = MPConv(base_channels, self.emb_channel, kernel=[])
+        self.emb_noise   = MPConv(base_channels, self.emb_channel, kernel=[])
 
+        # Optional conditioning label embedding (same pattern as EDM2 UNet)
+        self.emb_label = MPConv(label_dim, self.emb_channel, kernel=[]) if label_dim > 0 else None
+
+        # Encoder
         self.enc = torch.nn.ModuleList()
         for i in range(len(self.x_channel)):
             if i == 0:
@@ -70,6 +75,7 @@ class MPModel(torch.nn.Module):
                 mlp = Block(self.x_channel[i - 1], self.x_channel[i], self.emb_channel, dropout)
             self.enc.append(mlp)
 
+        # Decoder
         self.dec = torch.nn.ModuleList()
         self.dec.append(Block(self.x_channel[-1], self.x_channel[-1], self.emb_channel, dropout))
         for i in range(len(self.x_channel) - 1, 0, -1):
@@ -79,11 +85,21 @@ class MPModel(torch.nn.Module):
         self.out_conv = MPConv(2 * self.x_channel[0], in_channels, kernel=[])
         self.out_gain = torch.nn.Parameter(torch.zeros([]))
         
-    def forward(self, x, noise_labels):
+    def forward(self, x, noise_labels, class_labels=None):
+        # x: [BS, 1, in_channels], noise_labels: [BS,]
 
-         # x: [BS, 1, 2], emb: [BS,]
-        emb = self.emb_noise(self.emb_fourier(noise_labels))
-        
+        # Time embedding
+        emb = self.emb_noise(self.emb_fourier(noise_labels))  # (BS, emb_channel)
+
+        # Blend in conditioning if provided (mirrors EDM2 UNet label blending)
+        if self.emb_label is not None and class_labels is not None:
+            emb = mp_sum(
+                emb,
+                self.emb_label(class_labels * np.sqrt(class_labels.shape[1])),
+                t=0.5,
+            )
+
+        # Encoder
         x = torch.cat([x, torch.ones_like(x[:, :, :1])], dim=-1)
         skips = []
         for i, block in enumerate(self.enc):
@@ -93,7 +109,7 @@ class MPModel(torch.nn.Module):
                 x = block(x, emb)
             skips.append(x)
         
-        # Decoder.
+        # Decoder
         for i, block in enumerate(self.dec):
             if i != 0:
                 x = mp_cat(x, skips.pop(), dim=-1, t=0.5)
@@ -110,12 +126,17 @@ class FlowPrecond(torch.nn.Module):
         sigma_max       = float('inf'),     # Maximum supported noise level.
         sigma_data      = 0.5,              # Expected standard deviation of the training data.
         in_channels     = 2,
+        label_dim       = 0,                # 0 = unconditional; set to 128 for ProteinMPNN conditioning
         **model_kwargs,                     # Keyword arguments for the underlying model.
     ):
         super().__init__()
         self.in_channels = in_channels
-        self.model = MPModel(in_channels, **model_kwargs)
+        self.label_dim   = label_dim
+        self.model = MPModel(in_channels, label_dim=label_dim, **model_kwargs)
 
-    def forward(self, x, t):
-        F_x = self.model(x, t.flatten())
+    def forward(self, x, t, class_labels=None):
+        # x: (BS, 1, in_channels)
+        # t: (BS,) or (BS, 1)
+        # class_labels: (BS, label_dim) or None
+        F_x = self.model(x, t.flatten(), class_labels=class_labels)
         return F_x

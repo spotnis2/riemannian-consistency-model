@@ -21,7 +21,8 @@ from . import misc
 
 _num_moments    = 3             # [num_scalars, sum_of_scalars, sum_of_squares]
 _reduce_dtype   = torch.float32 # Data type to use for initial per-tensor reduction.
-_counter_dtype  = torch.float64 # Data type to use for the internal counters.
+# _counter_dtype  = torch.float64 # Data type to use for the internal counters.
+_counter_dtype  = torch.float32 # Data type to use for the internal counters. --- CHANGED: use float32 instead of float64 to save memory and speed up computation, at the cost of some precision. This should be fine for most training statistics.
 _rank           = 0             # Rank of the current process.
 _sync_device    = None          # Device to use for multiprocess communication. None = single-process.
 _sync_called    = False         # Has _sync() been called yet?

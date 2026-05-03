@@ -127,13 +127,13 @@ class SideChainAngleDataset(Dataset):
         sequence_arrays = []
         structs_downloaded = 0
         for filename in tqdm(files, desc="Total Files", unit="file"):
-            # if structs_downloaded >= 1000:
-            #     break
+            if structs_downloaded >= 1000:
+                break
             with open(filename) as f:
                 for line in tqdm(f, total=sum(1 for _ in open(filename))):
                     #download from pdb database
-                    # if structs_downloaded >= 1000:
-                    #     break
+                    if structs_downloaded >= 1000:
+                        break
                     if line[5].isalpha():
                         try:
                             file_path = rcsb.fetch(line[:4], format="pdb", target_path="./data")
@@ -281,6 +281,33 @@ class SideChainAngleDataset(Dataset):
 
 if __name__ == "__main__":
     data = SideChainAngleDataset()
+        
+class SideChainAngles(Dataset):
+    def __init__(self, sc_path, cond_path, **kwargs):
+        sc     = np.load(sc_path)
+        angles = torch.tensor(sc['side_chains'], dtype=torch.float32)  # (N, L, 4)
+        mask   = torch.tensor(sc['mask'],        dtype=torch.float32)  # (N, L)
+        cond   = torch.load(cond_path, map_location='cpu')             # (N, L, 128)
 
+        # align seq len bw angles and conditioning
+        L = min(angles.shape[1], cond.shape[1])
+        angles, mask, cond = angles[:, :L, :], mask[:, :L], cond[:, :L, :]
 
-                
+        # flatten to valid residues only
+        valid       = mask.bool()           # (N, L)
+        self.angles = angles[valid]         # (M, 4)
+        self.cond   = cond[valid]           # (M, 128)
+
+        # wrap to [0, 2π), residue dim --> (M, 1, 4) for RCM convention
+        self.angles = (self.angles % (2 * torch.pi))[:, None, :]
+        print(f"SideChainAngles: {len(self.angles)} valid residues")
+
+    def __len__(self):
+        return len(self.angles)
+
+    def __getitem__(self, idx):
+        return self.angles[idx], self.cond[idx]  # (1, 4), (128,)
+
+    @property
+    def dimension(self):
+        return self.angles.shape[-1]  # 4

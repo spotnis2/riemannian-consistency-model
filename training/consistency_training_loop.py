@@ -46,7 +46,8 @@ def training_loop(
     resume_state_dump   = None,     # Start from the given training state, None = reset training state.
     resume_kimg         = 0,        # Start from the given training progress.
     cudnn_benchmark     = True,     # Enable torch.backends.cudnn.benchmark?
-    device              = torch.device('cuda'),
+    # device              = torch.device('cuda'),
+    device              = torch.device('mps') if torch.backends.mps.is_available() else torch.device('cpu'),
 ):
     # Initialize.
     start_time = time.time()
@@ -78,7 +79,9 @@ def training_loop(
         with torch.no_grad():
             images = torch.zeros([batch_gpu, 1, net.in_channels], device=device)
             sigma = torch.ones([batch_gpu], device=device)
-            misc.print_module_summary(net, [images, sigma], max_nesting=2)
+            # CHANGED: pass dummy class_labels if network uses conditioning
+            dummy_labels = torch.zeros([batch_gpu, net.label_dim], device=device) if getattr(net, 'label_dim', 0) > 0 else None
+            misc.print_module_summary(net, [images, sigma, dummy_labels], max_nesting=2)
 
     # Setup teacher model if we need it
     teacher_net = None 
@@ -101,8 +104,8 @@ def training_loop(
     loss_kwargs.update(teacher_model=teacher_net)
     loss_fn = dnnlib.util.construct_class_by_name(**loss_kwargs)
     optimizer = dnnlib.util.construct_class_by_name(params=net.parameters(), **optimizer_kwargs) # subclass of torch.optim.Optimizer
-    ddp = torch.nn.parallel.DistributedDataParallel(net, device_ids=[device], find_unused_parameters=True)
-    # ddp = torch.nn.parallel.DistributedDataParallel(net, device_ids=[device], find_unused_parameters=False)
+    # ddp = torch.nn.parallel.DistributedDataParallel(net, device_ids=[device], find_unused_parameters=True)
+    ddp = net
     ema = copy.deepcopy(net).eval().requires_grad_(False)
 
     # Resume training from previous snapshot.
@@ -145,9 +148,20 @@ def training_loop(
         optimizer.zero_grad(set_to_none=True)
         for round_idx in range(num_accumulation_rounds):
             with misc.ddp_sync(ddp, (round_idx == num_accumulation_rounds - 1)):
-                x = next(dataset_iterator)
-                x = x.to(device)
-                loss = loss_fn(net=ddp, x=x, iter_steps=int(cur_nimg // batch_size))
+
+                # CHANGED: unpack (x, class_labels) tuple for conditioned datasets,
+                # or just x for unconditioned datasets (all existing ones unchanged).
+                batch = next(dataset_iterator)
+                if isinstance(batch, (list, tuple)):
+                    x, class_labels = batch
+                    x            = x.to(device)
+                    class_labels = class_labels.to(device)
+                else:
+                    x            = batch.to(device)
+                    class_labels = None
+
+                # CHANGED: pass class_labels through to loss function
+                loss = loss_fn(net=ddp, x=x, class_labels=class_labels, iter_steps=int(cur_nimg // batch_size))
                 training_stats.report('Loss/loss', loss)
                 loss.sum().mul(loss_scaling / batch_gpu_total).backward()
 
@@ -181,9 +195,12 @@ def training_loop(
         fields += [f"sec/kimg {training_stats.report0('Timing/sec_per_kimg', (tick_end_time - tick_start_time) / (cur_nimg - tick_start_nimg) * 1e3):<7.2f}"]
         fields += [f"maintenance {training_stats.report0('Timing/maintenance_sec', maintenance_time):<6.1f}"]
         fields += [f"cpumem {training_stats.report0('Resources/cpu_mem_gb', psutil.Process(os.getpid()).memory_info().rss / 2**30):<6.2f}"]
-        fields += [f"gpumem {training_stats.report0('Resources/peak_gpu_mem_gb', torch.cuda.max_memory_allocated(device) / 2**30):<6.2f}"]
-        fields += [f"reserved {training_stats.report0('Resources/peak_gpu_mem_reserved_gb', torch.cuda.max_memory_reserved(device) / 2**30):<6.2f}"]
-        torch.cuda.reset_peak_memory_stats()
+        # fields += [f"gpumem {training_stats.report0('Resources/peak_gpu_mem_gb', torch.cuda.max_memory_allocated(device) / 2**30):<6.2f}"]
+        # fields += [f"reserved {training_stats.report0('Resources/peak_gpu_mem_reserved_gb', torch.cuda.max_memory_reserved(device) / 2**30):<6.2f}"]
+        fields += [f"gpumem {training_stats.report0('Resources/peak_gpu_mem_gb', torch.cuda.max_memory_allocated(device) / 2**30 if torch.cuda.is_available() else 0):<6.2f}"]
+        fields += [f"reserved {training_stats.report0('Resources/peak_gpu_mem_reserved_gb', torch.cuda.max_memory_reserved(device) / 2**30 if torch.cuda.is_available() else 0):<6.2f}"]
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
         dist.print0(' '.join(fields))
 
         # Check for abort.
@@ -198,7 +215,9 @@ def training_loop(
             for key, value in data.items():
                 if isinstance(value, torch.nn.Module):
                     value = copy.deepcopy(value).eval().requires_grad_(False)
-                    misc.check_ddp_consistency(value)
+                    # misc.check_ddp_consistency(value)
+                    if torch.cuda.is_available():
+                        misc.check_ddp_consistency(value)
                     data[key] = value.cpu()
                 del value # conserve memory
             if dist.get_rank() == 0:

@@ -44,8 +44,9 @@ def parse_int_list(s):
 
 # Main options.
 @click.option('--num-samples',      help='Samples in datasets', metavar='N',                           type=int, default=10000, show_default=True)
-@click.option('--data',             help='Dataset path', metavar='STR',                                type=str, default=None, show_default=True)
-@click.option('--dataset-name',     help='Dataset name', metavar="STR",                                type=click.Choice(['Board', 'Protein', 'RNA', 'Rotation', 'Cone', 'Fisher', 'Line', 'Peak', 'Volcano', 'Earthquake', 'Fire', 'Flood']), default='Board', show_default=True)
+@click.option('--data',             help='Dataset path (sc_path for SideChain)', metavar='STR',        type=str, default=None, show_default=True)
+@click.option('--cond-path',        help='Path to conditioning_vectors.pt (SideChain only)',           type=str, default=None, show_default=True)
+@click.option('--dataset-name',     help='Dataset name', metavar="STR",                                type=click.Choice(['Board', 'Protein', 'RNA', 'Rotation', 'Cone', 'Fisher', 'Line', 'Peak', 'Volcano', 'Earthquake', 'Fire', 'Flood', 'SideChain']), default='Board', show_default=True)
 @click.option('--manifold',         help='Which manifold the data is on', metavar='STR',               type=click.Choice(['Euclidean', 'Torus', 'Sphere', 'SO3']), default='Euclidean', show_default=True)
 @click.option('--outdir',           help='Where to save the results', metavar='DIR',                   type=str, required=True)
 @click.option('--precond',          help='Preconditioning & loss function', metavar='flow',            type=click.Choice(['flow']), default='flow', show_default=True)
@@ -86,10 +87,16 @@ def main(**kwargs):
     c = dnnlib.EasyDict()
 
     # Random seed.
+    # if opts.seed is not None:
+    #     c.seed = opts.seed
+    # else:
+    #     seed = torch.randint(1 << 31, size=[], device=torch.device('cuda'))
+    #     torch.distributed.broadcast(seed, src=0)
+    #     c.seed = int(seed)
     if opts.seed is not None:
         c.seed = opts.seed
     else:
-        seed = torch.randint(1 << 31, size=[], device=torch.device('cuda'))
+        seed = torch.randint(1 << 31, size=[])
         torch.distributed.broadcast(seed, src=0)
         c.seed = int(seed)
 
@@ -118,6 +125,16 @@ def main(**kwargs):
         c.dataset_kwargs = dnnlib.EasyDict(class_name='datasets.sphere_dataset.Fire', root=opts.data)
     elif opts.dataset_name == 'Flood':
         c.dataset_kwargs = dnnlib.EasyDict(class_name='datasets.sphere_dataset.Flood', root=opts.data)
+    elif opts.dataset_name == 'SideChain':
+        if opts.data is None:
+            raise click.ClickException('--data (path to side_chain_data.npz) is required for SideChain dataset')
+        if opts.cond_path is None:
+            raise click.ClickException('--cond-path (path to conditioning_vectors.pt) is required for SideChain dataset')
+        c.dataset_kwargs = dnnlib.EasyDict(
+            class_name='datasets.torus_dataset.SideChainAngles',
+            sc_path=opts.data,
+            cond_path=opts.cond_path,
+        )
 
     c.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, num_workers=opts.workers, prefetch_factor=2)
     c.network_kwargs = dnnlib.EasyDict()
@@ -132,6 +149,10 @@ def main(**kwargs):
 
     # Network architecture.
     c.network_kwargs.update(in_channels=c.dataset_kwargs.data_dimension, base_channels=128, x_channel_mult=[2, 4, 4, 2], emb_channel_mult=2)
+    if opts.dataset_name == 'SideChain':
+        c.network_kwargs.update(label_dim=128)
+    else:
+        c.network_kwargs.update(label_dim=0)
 
     # Preconditioning & loss function.
     if opts.precond == 'flow':

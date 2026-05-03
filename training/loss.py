@@ -19,11 +19,11 @@ class FlowLoss:
         self.manifold = get_manifold(manifold, ndim=N)
         self.tmax = tmax
 
-    def __call__(self, net, x):
+    def __call__(self, net, x, class_labels=None):  # CHANGED: added class_labels=None
         t = torch.rand(x.size(0), device=x.device) * self.tmax
         n = self.manifold.rand(*x.shape, device=x.device)
         xt, vf = self.manifold.vecfield(n, x, t[:, None])
-        pred_vf = net(xt, t)
+        pred_vf = net(xt, t, class_labels)  # CHANGED: pass class_labels
         diff = pred_vf - vf
         loss = self.manifold.inner(diff, diff, xt)
         return loss
@@ -51,27 +51,32 @@ class ConsistencyLoss:
         self.distillation = distillation
         self.teacher_model = teacher_model
 
-    def __call__(self, net, x, iter_steps):
+    def __call__(self, net, x, class_labels=None, iter_steps=0):  # CHANGED: added class_labels=None
         t = torch.rand(x.size(0), device=x.device) * self.tmax
         t_expand = t[:, None, None]
         n = self.manifold.rand(*x.shape, device=x.device)
         xt, vf = self.manifold.vecfield(n, x, t[:, None])
         if self.distillation:
             with torch.no_grad():
-                vf = self.teacher_model(xt, t)
+                # CHANGED: pass class_labels to teacher
+                vf = self.teacher_model(xt, t, class_labels)
 
         # Here, we need to modify the tangent vector with the Jacobian to account for the potential coordinate transform.
         # For SO(3), the 3-vector representation is NOT the canonical Riemannian coordinate, so there will be a Jacobian term.
         # For Torus and Sphere, the ambient coordinates are Riemannian, so no Jacobian is needed (Jacobian is identity).
         tangents = (
             self.manifold.right_jac_inv(xt, vf) if hasattr(self.manifold, 'right_jac_inv') else vf,  # dx
-            torch.ones_like(t)  # dt
+            torch.ones_like(t),  # dt
+            # CHANGED: no tangent for class_labels (it's fixed conditioning, not a variable we differentiate through)
         )
+
+        # CHANGED: wrap net to fix class_labels so JVP only differentiates through (xt, t)
+        def net_with_labels(xt_, t_):
+            return net(xt_, t_, class_labels)
 
         # EDM2 modifies the parameters inplace, which will fail the forward-mode JVP calculation.
         # If you are not using EDM2, you may consider using torch.func.jvp for potentially better efficiency.
-        pred_vf, dvf = torch.autograd.functional.jvp(net, (xt, t), tangents, create_graph=True)
-        # pred_vf, dvf = torch.func.jvp(net, (xt, t), tangents)
+        pred_vf, dvf = torch.autograd.functional.jvp(net_with_labels, (xt, t), tangents, create_graph=True)  # CHANGED: use net_with_labels
         dvf = dvf.detach()
         pred_vf_detach = pred_vf.detach()
         u = (1 - t_expand) * pred_vf
@@ -111,7 +116,6 @@ class DiscreteConsistencyLoss:
             dt=0.01,
             distillation=False,
             teacher_model=None,
-
     ):
         if distillation:
             assert teacher_model is not None, 'Teacher model must be provided for distillation.'
@@ -121,7 +125,7 @@ class DiscreteConsistencyLoss:
         self.dt = dt
         self.tmax = tmax
 
-    def __call__(self, net, x, iter_steps):
+    def __call__(self, net, x, class_labels=None, iter_steps=0):  # CHANGED: added class_labels=None
         net_clone = deepcopy(net)  # workaround for inplace modification in EDM2
         t = torch.rand(x.size(0), device=x.device) * self.tmax
         t_expand = t[:, None, None]
@@ -129,13 +133,15 @@ class DiscreteConsistencyLoss:
         xt, vf = self.manifold.vecfield(n, x, t[:, None])
         if self.distillation:
             with torch.no_grad():
-                vf = self.teacher_model(xt, t)
+                # CHANGED: pass class_labels to teacher
+                vf = self.teacher_model(xt, t, class_labels)
 
-        pred_x1 = self.manifold.exp(xt, (1 - t_expand) * net(xt, t))
+        # CHANGED: pass class_labels to student and cloned student
+        pred_x1 = self.manifold.exp(xt, (1 - t_expand) * net(xt, t, class_labels))
         with torch.no_grad():
             xt_hat = self.manifold.exp(xt, self.dt * vf)
             pred_x1_hat = self.manifold.exp(
-                xt_hat, (1 - t_expand - self.dt) * net_clone(xt_hat, t + self.dt)
+                xt_hat, (1 - t_expand - self.dt) * net_clone(xt_hat, t + self.dt, class_labels)  # CHANGED
             ).detach()
             del net_clone
 
