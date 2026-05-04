@@ -51,26 +51,28 @@ class ConsistencyLoss:
         self.distillation = distillation
         self.teacher_model = teacher_model
 
-    def __call__(self, net, x, iter_steps):
+    def __call__(self, net, x, x_mask, cond, batch, iter_steps):
         t = torch.rand(x.size(0), device=x.device) * self.tmax
         t_expand = t[:, None, None]
         n = self.manifold.rand(*x.shape, device=x.device)
+        n[x_mask == 0] = x[x_mask == 0]        #FREEZE INVALID POSITIONS
         xt, vf = self.manifold.vecfield(n, x, t[:, None])
         if self.distillation:
             with torch.no_grad():
-                vf = self.teacher_model(xt, t)
-
+                vf = self.teacher_model(t, xt, batch)
+        vf = vf * x_mask
         # Here, we need to modify the tangent vector with the Jacobian to account for the potential coordinate transform.
         # For SO(3), the 3-vector representation is NOT the canonical Riemannian coordinate, so there will be a Jacobian term.
         # For Torus and Sphere, the ambient coordinates are Riemannian, so no Jacobian is needed (Jacobian is identity).
         tangents = (
             self.manifold.right_jac_inv(xt, vf) if hasattr(self.manifold, 'right_jac_inv') else vf,  # dx
+            torch.zeros_like(cond),
             torch.ones_like(t)  # dt
         )
 
         # EDM2 modifies the parameters inplace, which will fail the forward-mode JVP calculation.
         # If you are not using EDM2, you may consider using torch.func.jvp for potentially better efficiency.
-        pred_vf, dvf = torch.autograd.functional.jvp(net, (xt, t), tangents, create_graph=True)
+        pred_vf, dvf = torch.autograd.functional.jvp(net, (xt, cond, t), tangents, create_graph=True)
         # pred_vf, dvf = torch.func.jvp(net, (xt, t), tangents)
         dvf = dvf.detach()
         pred_vf_detach = pred_vf.detach()
@@ -92,12 +94,12 @@ class ConsistencyLoss:
         # tangent normalization
         g_normed = clip_jvp(g, self.jvp_max_norm).detach()
         if not self.simplified:
-            loss = self.manifold.inner(
-                pred_x1_detach - pred_x1 + g_normed, g_normed, pred_x1_detach
+            loss = self.manifold.inner_with_mask(
+                pred_x1_detach - pred_x1 + g_normed, g_normed, pred_x1_detach, x_mask
             ) * (t / (1 - t)).unsqueeze(-1).square()
         else:
-            loss = self.manifold.inner(
-                pred_vf.detach() - pred_vf + g_normed, g_normed, xt
+            loss = self.manifold.inner_with_mask(
+                pred_vf.detach() - pred_vf + g_normed, g_normed, xt, x_mask
             ) * (t / (1 - t)).unsqueeze(-1).square()
         return loss
 

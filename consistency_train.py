@@ -19,6 +19,7 @@ import torch
 import dnnlib
 from torch_utils import distributed as dist
 from training import consistency_training_loop
+from flowpacker.dataset_cluster import ProteinDataset
 
 warnings.filterwarnings('ignore', 'Grad strides do not match bucket view strides') # False warning printed by PyTorch 1.12.
 
@@ -118,6 +119,10 @@ def main(**kwargs):
         c.dataset_kwargs = dnnlib.EasyDict(class_name='datasets.sphere_dataset.Fire', root=opts.data)
     elif opts.dataset_name == 'Flood':
         c.dataset_kwargs = dnnlib.EasyDict(class_name='datasets.sphere_dataset.Flood', root=opts.data)
+    elif opts.dataset_name == 'SideChainAngleDatasetAlreadyLoaded':
+        c.dataset_kwargs = dnnlib.EasyDict(class_name='datasets.torus_dataset.SideChainAngleDatasetAlreadyLoaded', cond_path="./data/conditioning_vectors.pt", side_chain_path="./data/side_chain_data.pt")
+    elif opts.dataset_name == 'ProteinDataset':
+        c.dataset_kwargs = dnnlib.EasyDict(class_name='flowpacker.dataset_cluster.ProteinDataset', root=opts.data)
 
     c.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, num_workers=opts.workers, prefetch_factor=2)
     c.network_kwargs = dnnlib.EasyDict()

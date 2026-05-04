@@ -1,7 +1,7 @@
 from training.networks_edm2 import *
+import torch.nn as nn
 
-
-class Block(torch.nn.Module):
+class Block(nn.Module):
     def __init__(
         self, 
         in_channels,
@@ -45,7 +45,7 @@ class Block(torch.nn.Module):
         return x
 
 
-class MPModel(torch.nn.Module):
+class MPModel(nn.Module):
     def __init__(
         self, 
         in_channels=2,
@@ -78,11 +78,14 @@ class MPModel(torch.nn.Module):
 
         self.out_conv = MPConv(2 * self.x_channel[0], in_channels, kernel=[])
         self.out_gain = torch.nn.Parameter(torch.zeros([]))
+        self.cond_projector = nn.Linear(in_features=71, out_features=emb_channel)
         
-    def forward(self, x, noise_labels):
-
+    def forward(self, x, cond, noise_labels):  #forward(self, x, cond, noise_labels) 
+        #cond shape: [N, 71]
+        cond_proj = self.cond_projector(cond)
          # x: [BS, 1, 2], emb: [BS,]
         emb = self.emb_noise(self.emb_fourier(noise_labels))
+        emb_full = mp_sum(emb, cond_proj, t=0.5)
         
         x = torch.cat([x, torch.ones_like(x[:, :, :1])], dim=-1)
         skips = []
@@ -90,7 +93,7 @@ class MPModel(torch.nn.Module):
             if i == 0:
                 x = block(x)
             else:
-                x = block(x, emb)
+                x = block(x, emb_full)
             skips.append(x)
         
         # Decoder.
@@ -116,6 +119,21 @@ class FlowPrecond(torch.nn.Module):
         self.in_channels = in_channels
         self.model = MPModel(in_channels, **model_kwargs)
 
-    def forward(self, x, t):
-        F_x = self.model(x, t.flatten())
+    def forward(self, x, cond, t):
+        F_x = self.model(x, cond, t.flatten())
         return F_x
+
+class FlowPackerWrapper(torch.nn.Module):
+    def __init__(self):
+        ckpt_dict = torch.load("flowpacker/checkpoints/cluster.pth")
+        train_cfg = ckpt_dict['config']
+        self.model = CNF(EquiformerV2(**train_cfg.model), train_cfg, coeff=5.0,
+                         stepsize=10, mode='vf').cuda()
+        self.ema = load_ema(self.model, decay=train_cfg.train.ema)
+        self.model, self.ema = load_checkpoint(self.model, self.ema, ckpt_dict)
+        self.model.eval()
+    
+    def forward(self, t, xt, batch):
+        return self.model.get_vf(t, xt, batch)
+
+        

@@ -316,6 +316,10 @@ class Torus(Manifold):
     @classmethod
     def inner(cls, u: Tensor, v: Tensor, x: Tensor, eps=_EPS) -> Tensor:
         return (u * v).sum(-1)
+    
+    @classmethod
+    def inner_with_mask(cls, u: Tensor, v: Tensor, x: Tensor, mask: Tensor, eps=_EPS) -> Tensor:
+        return (u * v * mask).sum(-1) / mask.sum(-1).clamp(1)
 
     @classmethod
     def dist(cls, x: Tensor, y: Tensor, eps=_EPS) -> Tensor:

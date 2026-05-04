@@ -18,8 +18,14 @@ import psutil
 import torch
 
 import dnnlib
+from torch_geometric.loader import DataLoader as PyGDataLoader
+from torch_geometric.nn import global_mean_pool
+
 from torch_utils import distributed as dist
 from torch_utils import misc, training_stats
+from flowpacker.dataset_cluster import ProteinDataset
+
+from networks import FlowPackerWrapper
 
 #----------------------------------------------------------------------------
 
@@ -48,6 +54,44 @@ def training_loop(
     cudnn_benchmark     = True,     # Enable torch.backends.cudnn.benchmark?
     device              = torch.device('cuda'),
 ):
+
+    def protein_graph_conditioning(batch):
+        bb_dihedrals, pos, aa_onehot, aa_mask = batch.bb_dihedral, batch.pos, batch.aa_onehot, batch.aa_mask.float()
+
+        pos_flat = pos.reshape(pos.shape[0], -1)
+
+        initial_cond = torch.cat([bb_dihedrals.sin(), bb_dihedrals.cos(), pos_flat, aa_onehot], dim=-1)
+
+        num_graphs = int(batch.num_graphs)
+        dev = initial_cond.device
+        dty = initial_cond.dtype
+        dfeat = initial_cond.size(-1)
+        bidx = batch.batch
+
+        #global mean pooling - have to do this becaause global_mean_pool will include all nodes including padding ones
+        sums = torch.zeros(num_graphs, dfeat, device=dev, dtype=dty)
+        counts = torch.zeros(num_graphs, device=dev, dtype=dty)
+        sums.index_add_(0, bidx, initial_cond * aa_m.unsqueeze(-1))
+        counts.index_add_(0, bidx, aa_mask)
+        mean_pool = sums / counts.clamp(min=1e-8).unsqueeze(-1)
+        node_count = torch.log1p(counts).unsqueeze(-1)
+
+
+        row, col = batch.edge_index
+        edge_counts = torch.zeros(num_graphs, device=dev, dtype=dty)
+        if row.numel() > 0:
+            eb = bidx[row]
+            valid = (aa_m[row] != 0) & (aa_m[col] != 0)
+            if valid.any():
+                edge_counts.index_add_(
+                    0, eb[valid], torch.ones(int(valid.sum().item()), device=dev, dtype=dty)
+                )
+        edge_count = torch.log1p(edge_counts).unsqueeze(-1)
+
+        cond_vector = torch.cat([mean_pool, node_count, edge_count], dim=-1)
+
+        return cond_vector
+
     # Initialize.
     start_time = time.time()
     np.random.seed((seed * dist.get_world_size() + dist.get_rank()) % (1 << 31))
@@ -68,7 +112,10 @@ def training_loop(
     dist.print0('Loading dataset...')
     dataset_obj = dnnlib.util.construct_class_by_name(**dataset_kwargs) # subclass of training.dataset.Dataset
     dataset_sampler = misc.InfiniteSampler(dataset=dataset_obj, rank=dist.get_rank(), num_replicas=dist.get_world_size(), seed=seed)
-    dataset_iterator = iter(torch.utils.data.DataLoader(dataset=dataset_obj, sampler=dataset_sampler, batch_size=batch_gpu, **data_loader_kwargs))
+    if dataset_obj.class_name == 'flowpacker.dataset_cluster.ProteinDataset':
+        dataset_iterator = iter(PyGDataLoader(dataset=dataset_obj, sampler=dataset_sampler, batch_size=batch_gpu, **data_loader_kwargs))
+    else:
+        dataset_iterator = iter(torch.utils.data.DataLoader(dataset=dataset_obj, sampler=dataset_sampler, batch_size=batch_gpu, **data_loader_kwargs))
 
     # Construct network.
     dist.print0('Constructing network...')
@@ -89,8 +136,11 @@ def training_loop(
 
         # Load network.
         dist.print0(f'Loading teacher network from "{loss_kwargs.teacher_model}"...')
-        with dnnlib.util.open_url(loss_kwargs.teacher_model, verbose=(dist.get_rank() == 0)) as f:
-            teacher_net = pickle.load(f)['ema'].to(device)
+        if dataset_obj.class_name == 'flowpacker.dataset_cluster.ProteinDataset':
+            teacher_net = FlowPackerWrapper()
+        else:
+            with dnnlib.util.open_url(loss_kwargs.teacher_model, verbose=(dist.get_rank() == 0)) as f:
+                teacher_net = pickle.load(f)['ema'].to(device)
 
         # Other ranks follow.
         if dist.get_rank() == 0:
@@ -140,14 +190,16 @@ def training_loop(
     dist.update_progress(cur_nimg // 1000, total_kimg)
     stats_jsonl = None
     while True:
-
         # Accumulate gradients.
         optimizer.zero_grad(set_to_none=True)
         for round_idx in range(num_accumulation_rounds):
             with misc.ddp_sync(ddp, (round_idx == num_accumulation_rounds - 1)):
-                x = next(dataset_iterator)
-                x = x.to(device)
-                loss = loss_fn(net=ddp, x=x, iter_steps=int(cur_nimg // batch_size))
+                batch = next(dataset_iterator)
+                batch = batch.to(device)
+                #conditioning function
+                cond_graph = protein_graph_conditioning(batch) 
+                cond = cond_graph[batch.batch]
+                loss = loss_fn(net=ddp, x=batch.chi, x_mask=batch.chi_mask, cond=cond, batch=batch, iter_steps=int(cur_nimg // batch_size))
                 training_stats.report('Loss/loss', loss)
                 loss.sum().mul(loss_scaling / batch_gpu_total).backward()
 
